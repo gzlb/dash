@@ -294,4 +294,7 @@ def main():
     app.run()
 
 
-if __nam
+if __name__ == "__main__":
+    main()
+
+
