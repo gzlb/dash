@@ -1,0 +1,456 @@
+import streamlit as st
+import pandas as pd
+import uuid
+from typing import List, Dict
+from abc import ABC, abstractmethod
+
+# ------------------ FILTER WIDGET ------------------ #
+class FilterWidget:
+    """
+    A standalone filter widget that:
+      - Parses 'date' -> 'year', 'quarter', 'month'
+      - Displays user-friendly labels for quarters (Q1-Q4) and months (January, etc.)
+      - Returns the filtered DataFrame
+    """
+
+    quarter_map = {1: "Q1", 2: "Q2", 3: "Q3", 4: "Q4"}
+    # Reverse map: "Q1" -> 1, "Q2" -> 2, ...
+    quarter_map_inv = {v: k for k, v in quarter_map.items()}
+
+    month_map = {
+        1: "January", 2: "February", 3: "March", 4: "April",
+        5: "May", 6: "June", 7: "July", 8: "August",
+        9: "September", 10: "October", 11: "November", 12: "December"
+    }
+    # Reverse map: "January" -> 1, "February" -> 2, ...
+    month_map_inv = {v: k for k, v in month_map.items()}
+
+    def __init__(self, df: pd.DataFrame, widget_key_prefix: str):
+        """
+        :param df: The unfiltered DataFrame
+        :param widget_key_prefix: A unique string to differentiate widget keys
+        """
+        self.df = df.copy()
+        self.widget_key_prefix = widget_key_prefix
+
+    def render(self) -> pd.DataFrame:
+        """
+        Display the filter UI (year, quarter, month) with friendly labels, return filtered DataFrame.
+        """
+        if "date" not in self.df.columns:
+            st.warning("No 'date' column found. Skipping date-based filters.")
+            return self.df
+
+        # Convert 'date' to datetime
+        self.df["date"] = pd.to_datetime(self.df["date"], errors="coerce")
+
+        # Create year, quarter, month numeric columns
+        self.df["year"] = self.df["date"].dt.year
+        self.df["quarter"] = self.df["date"].dt.quarter
+        self.df["month"] = self.df["date"].dt.month
+
+        # --- YEAR FILTER ---
+        available_years = sorted(self.df["year"].dropna().unique())
+        year_key = f"{self.widget_key_prefix}_year"
+        selected_years = st.multiselect(
+            "Filter by Years",
+            options=available_years,
+            key=year_key
+        )
+        df_filtered = self.df
+        if selected_years:
+            df_filtered = df_filtered[df_filtered["year"].isin(selected_years)]
+
+        # --- QUARTER FILTER (friendly labels) ---
+        quarter_key = f"{self.widget_key_prefix}_quarter"
+        available_quarters_num = sorted(df_filtered["quarter"].dropna().unique())
+        # Convert numeric quarters -> label (Q1..Q4)
+        available_quarters_str = [self.quarter_map[q] for q in available_quarters_num if q in self.quarter_map]
+        selected_quarters_labels = st.multiselect(
+            "Filter by Quarters",
+            options=available_quarters_str,
+            key=quarter_key
+        )
+        if selected_quarters_labels:
+            # Convert back to numeric
+            selected_quarters_num = [self.quarter_map_inv[label] for label in selected_quarters_labels]
+            df_filtered = df_filtered[df_filtered["quarter"].isin(selected_quarters_num)]
+
+        # --- MONTH FILTER (friendly labels) ---
+        month_key = f"{self.widget_key_prefix}_month"
+        available_months_num = sorted(df_filtered["month"].dropna().unique())
+        available_months_str = [self.month_map[m] for m in available_months_num if m in self.month_map]
+        selected_months_labels = st.multiselect(
+            "Filter by Months",
+            options=available_months_str,
+            key=month_key
+        )
+        if selected_months_labels:
+            selected_months_num = [self.month_map_inv[m] for m in selected_months_labels]
+            df_filtered = df_filtered[df_filtered["month"].isin(selected_months_num)]
+
+        st.write(f"Rows after filter: {len(df_filtered)}")
+        return df_filtered
+
+
+# ------------------ TAB BASE CLASS ------------------ #
+class Tab(ABC):
+    def __init__(self, data_manager=None):
+        self.data_manager = data_manager
+        self.tab_id = str(uuid.uuid4())  # unique ID to avoid widget key collisions
+
+    @abstractmethod
+    def render(self):
+        pass
+
+
+# ------------------ TAB FACTORY ------------------ #
+class TabFactory:
+    def __init__(self):
+        self._tab_classes: Dict[str, Tab] = {}
+        self.discover_tabs()
+
+    def discover_tabs(self):
+        for subclass in Tab.__subclasses__():
+            tab_name = subclass.__name__
+            self._tab_classes[tab_name] = subclass
+
+    def create_tab(self, tab_name: str, data_manager=None) -> Tab:
+        if tab_name not in self._tab_classes:
+            raise ValueError(f"Tab '{tab_name}' is not registered.")
+        return self._tab_classes[tab_name](data_manager=data_manager)
+
+    def get_tab_options(self) -> List[dict]:
+        return [{"label": name, "value": name} for name in self._tab_classes.keys()]
+
+
+# ------------------ DATA MANAGER ------------------ #
+class DataManager:
+    def __init__(self):
+        # unique_id -> (df, filename)
+        self.data_map = {}
+
+    def load_data(self, file_obj) -> str:
+        unique_id = str(uuid.uuid4())
+        filename = file_obj.name.lower()
+
+        if filename.endswith(".xlsx"):
+            try:
+                df = pd.read_excel(file_obj)
+            except ImportError:
+                st.error("Could not import openpyxl. Install via `pip install openpyxl`.")
+                return ""
+        elif filename.endswith(".csv"):
+            df = pd.read_csv(file_obj)
+        else:
+            st.warning(f"Unsupported file type: {file_obj.name}")
+            return ""
+
+        self.data_map[unique_id] = (df, file_obj.name)
+        return unique_id
+
+    def aggregate_data(self) -> pd.DataFrame:
+        if not self.data_map:
+            return pd.DataFrame()
+        all_dfs = [pair[0] for pair in self.data_map.values()]
+        if len(all_dfs) == 1:
+            return all_dfs[0]
+        return pd.concat(all_dfs, ignore_index=True)
+
+    def get_column_names(self) -> List[str]:
+        return list(self.aggregate_data().columns)
+
+
+# ------------------ UPLOAD TAB ------------------ #
+class UploadTab(Tab):
+    def render(self):
+        st.subheader(f"Upload Tab (ID: {self.tab_id[:8]})")
+
+        widget_key = f"upload_files_{self.tab_id}"
+        uploaded_files = st.file_uploader(
+            "Upload CSV or XLSX files",
+            type=["csv", "xlsx"],
+            accept_multiple_files=True,
+            key=widget_key
+        )
+        if uploaded_files:
+            for f in uploaded_files:
+                uid = self.data_manager.load_data(f)
+                if uid:
+                    st.success(f"Uploaded: {f.name} (UUID: {uid[:8]})")
+
+        # Show combined data
+        df = self.data_manager.aggregate_data()
+        if not df.empty:
+            st.write("Combined Data Preview:")
+            st.dataframe(df.head(20))
+        else:
+            st.write("No data uploaded yet.")
+
+
+# ------------------ PLOT TAB ------------------ #
+class PlotTab(Tab):
+    def render(self):
+        st.subheader(f"Plot Tab (ID: {self.tab_id[:8]})")
+
+        df = self.data_manager.aggregate_data()
+        if df.empty:
+            st.warning("No data available. Please upload files first.")
+            return
+
+        # Use our FilterWidget
+        filter_prefix = f"plot_filter_{self.tab_id}"
+        df_filtered = FilterWidget(df, filter_prefix).render()
+        if df_filtered.empty:
+            st.warning("No data after filtering.")
+            return
+
+        if "date" not in df_filtered.columns or "nominal" not in df_filtered.columns:
+            st.error("Data must have 'date' and 'nominal' columns to plot.")
+            return
+
+        df_filtered = df_filtered.dropna(subset=["date", "nominal"]).sort_values("date")
+        st.line_chart(data=df_filtered, x="date", y="nominal")
+
+
+# ------------------ AGGREGATION TAB ------------------ #
+class AggregationTab(Tab):
+    """
+    - Allows user to filter by Q1-Q4, months (Jan-Dec), etc. 
+    - Optionally convert currencies (if present) to unify nominal in USD.
+    - Groups and sums 'nominal' (with currency included if not converting).
+    - Displays a bar chart of aggregated results.
+    """
+    def render(self):
+        st.subheader(f"Aggregation Tab (ID: {self.tab_id[:8]})")
+
+        df = self.data_manager.aggregate_data()
+        if df.empty:
+            st.warning("No data available.")
+            return
+
+        # 1. Filter locally
+        filter_prefix = f"agg_filter_{self.tab_id}"
+        df_filtered = FilterWidget(df, filter_prefix).render()
+        if df_filtered.empty:
+            st.warning("No data left after filtering.")
+            return
+
+        # 2. Optional currency conversion
+        # We'll do a simple dictionary for demonstration:
+        exchange_rates = {"USD": 1.0, "EUR": 1.05, "GBP": 1.2}
+
+        convert_to_usd = st.checkbox("Convert all currencies to USD?", key=f"currency_conv_{self.tab_id}")
+        if convert_to_usd and "currency" in df_filtered.columns:
+            # We'll unify all 'nominal' to the same currency: USD
+            def convert_row(row):
+                cur = row["currency"]
+                if cur in exchange_rates:
+                    # We'll treat 'nominal' as row["nominal"] * (1 / rate) or rate?
+                    # Actually, if 1 EUR = 1.05 USD, then 1 EUR nominal -> 1.05 nominal in USD
+                    return row["nominal"] * exchange_rates[cur]
+                else:
+                    return row["nominal"]  # unknown currency -> no conversion?
+
+            df_filtered["nominal"] = df_filtered.apply(convert_row, axis=1)
+            # Now that it's all in USD, we can remove 'currency' from the grouping
+            if "currency" in df_filtered.columns:
+                df_filtered.drop(columns=["currency"], inplace=True)
+
+        # Must have 'nominal' to aggregate
+        if "nominal" not in df_filtered.columns:
+            st.error("No 'nominal' column found.")
+            return
+
+        st.write(f"Rows in final dataset: {len(df_filtered)}")
+
+        # 3. Grouping
+        groupable_cols = []
+        for c in df_filtered.columns:
+            clower = c.lower()
+            if clower not in {"nominal", "date", "year", "quarter", "month", "trade id"}:
+                # If currency is still present (no conversion), we want to allow grouping by currency
+                groupable_cols.append(c)
+
+        selected_group_cols = st.multiselect(
+            "Group By Columns",
+            options=groupable_cols,
+            default=[],
+            key=f"aggregation_groupby_{self.tab_id}"
+        )
+
+        if selected_group_cols:
+            # Perform groupby
+            grouped = df_filtered.groupby(selected_group_cols, dropna=False, as_index=False)["nominal"].sum()
+            st.write(f"Aggregated by {selected_group_cols}, summing 'nominal':")
+            st.dataframe(grouped)
+
+            # 4. Bar chart of aggregated results
+            # We'll attempt a simple bar chart. If multiple group-by columns, 
+            # it might not be very meaningful. Typically you'd do 1 grouping col for a bar chart.
+            if len(selected_group_cols) == 1:
+                x_col = selected_group_cols[0]
+                st.bar_chart(data=grouped, x=x_col, y="nominal")
+            else:
+                st.info("Bar chart is only straightforward if you group by exactly one column.")
+        else:
+            st.write("No grouping columns selected. Showing raw filtered data:")
+            st.dataframe(df_filtered)
+
+
+# ------------------ SHEET MANAGER ------------------ #
+class SheetManager:
+    def __init__(self):
+        self.sheets = []
+
+    def add_sheet(self):
+        self.sheets.append([])
+
+    def delete_sheet(self, index: int):
+        if 0 <= index < len(self.sheets):
+            self.sheets.pop(index)
+
+    def add_tab_to_sheet(self, sheet_index: int, tab: Tab):
+        if 0 <= sheet_index < len(self.sheets):
+            self.sheets[sheet_index].append(tab)
+
+    def delete_tab_from_sheet(self, sheet_index: int, tab_index: int):
+        if 0 <= sheet_index < len(self.sheets):
+            if 0 <= tab_index < len(self.sheets[sheet_index]):
+                self.sheets[sheet_index].pop(tab_index)
+
+    def get_sheet_count(self) -> int:
+        return len(self.sheets)
+
+    def get_tabs_in_sheet(self, sheet_index: int) -> List[Tab]:
+        if 0 <= sheet_index < len(self.sheets):
+            return self.sheets[sheet_index]
+        return []
+
+    def render_sheet(self, sheet_index: int):
+        if sheet_index < 0 or sheet_index >= len(self.sheets):
+            st.write("No sheet selected.")
+            return
+
+        tabs = self.sheets[sheet_index]
+        if not tabs:
+            st.write("This sheet has no tabs.")
+            return
+
+        tab_titles = [
+            f"{i+1}: {type(t).__name__} [{t.tab_id[:8]}]" 
+            for i, t in enumerate(tabs)
+        ]
+        st_tabs = st.tabs(tab_titles)
+        for i, tab_instance in enumerate(tabs):
+            with st_tabs[i]:
+                tab_instance.render()
+
+
+# ------------------ STREAMLIT APP ------------------ #
+class StreamlitApp:
+    def __init__(self):
+        pass
+
+    def run(self):
+        st.title("OOP Dashboard: Friendly Quarters, Months, Optional Currency Conversion")
+
+        self.init_session_state()
+
+        sheet_manager: SheetManager = st.session_state["sheet_manager"]
+        data_manager: DataManager = st.session_state["data_manager"]
+        tab_factory: TabFactory = st.session_state["tab_factory"]
+
+        # -------------- LEFT SIDEBAR: SHEET CONTROLS -------------- #
+        with st.sidebar:
+            st.header("Sheet Management")
+
+            # Add a new sheet
+            if st.button("Add New Sheet", key="add_sheet_btn"):
+                sheet_manager.add_sheet()
+                st.session_state["active_sheet_idx"] = sheet_manager.get_sheet_count() - 1
+
+            sheet_count = sheet_manager.get_sheet_count()
+            if sheet_count > 0:
+                st.subheader("Existing Sheets:")
+                for i in range(sheet_count):
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        if st.button(f"Sheet {i+1}", key=f"sheet_nav_btn_{i}"):
+                            st.session_state["active_sheet_idx"] = i
+                    with col2:
+                        if st.button("X", key=f"sheet_delete_btn_{i}"):
+                            sheet_manager.delete_sheet(i)
+                            if st.session_state["active_sheet_idx"] >= sheet_manager.get_sheet_count():
+                                st.session_state["active_sheet_idx"] = sheet_manager.get_sheet_count() - 1
+                            st.experimental_rerun()
+
+                active_sheet_idx = st.session_state["active_sheet_idx"]
+                if 0 <= active_sheet_idx < sheet_manager.get_sheet_count():
+                    st.markdown(f"**Active Sheet**: {active_sheet_idx + 1}")
+                else:
+                    st.write("No valid sheet selected.")
+            else:
+                st.write("No sheets yet. Create one above.")
+
+        # -------------- MAIN AREA: TABS FOR ACTIVE SHEET -------------- #
+        if sheet_manager.get_sheet_count() > 0:
+            active_sheet_idx = st.session_state["active_sheet_idx"]
+            st.write(f"### Active Sheet: {active_sheet_idx + 1}")
+
+            # Add a new tab
+            tab_options = tab_factory.get_tab_options()
+            tab_types = [opt["value"] for opt in tab_options]
+            selected_tab_type = st.selectbox(
+                "Select Tab Type to Add",
+                options=tab_types,
+                key="select_tab_type_main"
+            )
+            if st.button("Add Tab", key="add_tab_btn_main"):
+                new_tab = tab_factory.create_tab(selected_tab_type, data_manager=data_manager)
+                sheet_manager.add_tab_to_sheet(active_sheet_idx, new_tab)
+                st.experimental_rerun()
+
+            # Delete a tab
+            existing_tabs = sheet_manager.get_tabs_in_sheet(active_sheet_idx)
+            if existing_tabs:
+                delete_tab_options = [
+                    f"{i+1}: {type(tab).__name__} [{tab.tab_id[:8]}]"
+                    for i, tab in enumerate(existing_tabs)
+                ]
+                tab_to_delete = st.selectbox(
+                    "Select Tab to Delete",
+                    options=["<none>"] + delete_tab_options,
+                    key="delete_tab_select"
+                )
+                if st.button("Delete Tab", key="delete_tab_btn"):
+                    if tab_to_delete != "<none>":
+                        delete_index = delete_tab_options.index(tab_to_delete)
+                        sheet_manager.delete_tab_from_sheet(active_sheet_idx, delete_index)
+                        st.experimental_rerun()
+
+            st.markdown("---")
+
+            # Render the active sheet
+            sheet_manager.render_sheet(active_sheet_idx)
+        else:
+            st.write("No sheets to display. Please create one in the sidebar.")
+
+    def init_session_state(self):
+        if "data_manager" not in st.session_state:
+            st.session_state["data_manager"] = DataManager()
+        if "tab_factory" not in st.session_state:
+            st.session_state["tab_factory"] = TabFactory()
+        if "sheet_manager" not in st.session_state:
+            st.session_state["sheet_manager"] = SheetManager()
+        if "active_sheet_idx" not in st.session_state:
+            st.session_state["active_sheet_idx"] = 0
+
+
+def main():
+    app = StreamlitApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
