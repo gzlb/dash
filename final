@@ -1,0 +1,423 @@
+import streamlit as st
+import pandas as pd
+import uuid
+from typing import List, Dict
+from abc import ABC, abstractmethod
+import plotly.express as px
+
+
+# ------------------ HELPER FUNCTIONS ------------------ #
+def select_nominal_column(df: pd.DataFrame, tab_id: str) -> str:
+    """
+    Helper function to select between 'nominal' and 'nominal_eur'.
+    Defaults to 'nominal'.
+    """
+    options = [col for col in ["nominal", "nominal_eur"] if col in df.columns]
+    if not options:
+        raise ValueError("Neither 'nominal' nor 'nominal_eur' is available in the dataset.")
+    return st.selectbox("Select Column for Analysis", options=options, index=0, key=f"select_nominal_{tab_id}")
+
+
+def parse_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse 'date' column and derive 'year', 'quarter', and 'month' columns.
+    """
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        df["year"] = df["date"].dt.year
+        df["quarter"] = df["date"].dt.quarter
+        df["month"] = df["date"].dt.month
+    return df
+
+
+def apply_filters(df: pd.DataFrame, year: List[int] = None, quarter: List[int] = None, month: List[int] = None) -> pd.DataFrame:
+    """
+    Apply year, quarter, and month filters to a DataFrame.
+    """
+    if year:
+        df = df[df["year"].isin(year)]
+    if quarter:
+        df = df[df["quarter"].isin(quarter)]
+    if month:
+        df = df[df["month"].isin(month)]
+    return df
+
+
+def validate_columns(df: pd.DataFrame, required_cols: List[str]) -> bool:
+    """
+    Validate that all required columns exist in the DataFrame.
+    """
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        st.error(f"Missing required columns: {', '.join(missing_cols)}")
+        return False
+    return True
+
+
+def group_by_columns(df: pd.DataFrame, group_cols: List[str], agg_col: str, agg_funcs: List[str] = ["sum"]) -> pd.DataFrame:
+    """
+    Group a DataFrame by specified columns, aggregate a target column, and return the result.
+    """
+    if not group_cols or agg_col not in df.columns:
+        raise ValueError("Group columns or aggregation column not found in DataFrame.")
+    return df.groupby(group_cols, as_index=False)[agg_col].agg(agg_funcs).reset_index()
+
+
+def create_plotly_chart(df: pd.DataFrame, x: str, y: str, color: str = None, chart_type: str = "line", title: str = ""):
+    """
+    Create a Plotly chart (line or bar) from a DataFrame.
+    """
+    if chart_type == "line":
+        fig = px.line(df, x=x, y=y, color=color, title=title)
+    elif chart_type == "bar":
+        fig = px.bar(df, x=x, y=y, color=color, title=title)
+    else:
+        raise ValueError("Unsupported chart type. Use 'line' or 'bar'.")
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ------------------ FILTER WIDGET ------------------ #
+class FilterWidget:
+    def __init__(self, df: pd.DataFrame, widget_key_prefix: str):
+        self.df = parse_date_columns(df)
+        self.widget_key_prefix = widget_key_prefix
+
+    def render(self) -> pd.DataFrame:
+        selected_years = st.multiselect("Filter by Years", sorted(self.df["year"].dropna().unique()), key=f"{self.widget_key_prefix}_year")
+        selected_quarters = st.multiselect("Filter by Quarters", ["Q1", "Q2", "Q3", "Q4"], key=f"{self.widget_key_prefix}_quarter")
+        selected_months = st.multiselect("Filter by Months", ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"], key=f"{self.widget_key_prefix}_month")
+
+        quarter_map_inv = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+        month_map_inv = {month: idx + 1 for idx, month in enumerate(["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"])}
+
+        selected_quarters = [quarter_map_inv[q] for q in selected_quarters]
+        selected_months = [month_map_inv[m] for m in selected_months]
+
+        return apply_filters(self.df, year=selected_years, quarter=selected_quarters, month=selected_months)
+
+
+# ------------------ TAB BASE CLASS ------------------ #
+class Tab(ABC):
+    def __init__(self, data_manager=None):
+        self.data_manager = data_manager
+        self.tab_id = str(uuid.uuid4())
+
+    @abstractmethod
+    def render(self):
+        pass
+
+
+# ------------------ PLOT TAB ------------------ #
+class PlotTab(Tab):
+    def render(self):
+        st.subheader(f"Plot Tab (ID: {self.tab_id[:8]})")
+
+        df = self.data_manager.aggregate_data()
+        if df.empty:
+            st.warning("No data available. Please upload files first.")
+            return
+
+        # Filter
+        filter_prefix = f"plot_filter_{self.tab_id}"
+        df_filtered = FilterWidget(df, filter_prefix).render()
+        if df_filtered.empty:
+            st.warning("No data after filtering.")
+            return
+
+        # Select column: nominal or nominal_eur
+        selected_column = select_nominal_column(df_filtered, self.tab_id)
+
+        # Grouping options
+        possible_groups = [c for c in ["general classification", "type", "client"] if c in df_filtered.columns]
+        group_key = f"plot_group_{self.tab_id}"
+        selected_group = st.selectbox(
+            "Group By (e.g., general classification, type, or client)",
+            options=possible_groups,
+            key=group_key
+        )
+
+        # Group data
+        df_plot = (
+            df_filtered
+            .groupby(["date", selected_group], as_index=False)[selected_column]
+            .sum()
+            .sort_values("date")
+        )
+
+        # Plot
+        create_plotly_chart(df_plot, x="date", y=selected_column, color=selected_group, chart_type="line", title="Time Series Plot")
+
+
+# ------------------ AGGREGATION TAB ------------------ #
+class AggregationTab(Tab):
+    def render(self):
+        st.subheader(f"Aggregation Tab (ID: {self.tab_id[:8]})")
+
+        df = self.data_manager.aggregate_data()
+        if df.empty:
+            st.warning("No data available.")
+            return
+
+        # Filter
+        filter_prefix = f"agg_filter_{self.tab_id}"
+        df_filtered = FilterWidget(df, filter_prefix).render()
+        if df_filtered.empty:
+            st.warning("No data left after filtering.")
+            return
+
+        # Select column: nominal or nominal_eur
+        selected_column = select_nominal_column(df_filtered, self.tab_id)
+
+        # Grouping options
+        possible_groups = [c for c in ["general classification", "type", "client"] if c in df_filtered.columns]
+        group_key = f"agg_group_{self.tab_id}"
+        selected_group = st.selectbox(
+            "Group By (e.g., general classification, type, or client)",
+            options=possible_groups,
+            key=group_key
+        )
+
+        # Calculate max, min, avg
+        df_agg = group_by_columns(df_filtered, ["year", "month", selected_group], selected_column, ["max", "min", "mean"])
+        df_agg.rename(columns={"max": "Maximum", "min": "Minimum", "mean": "Average"}, inplace=True)
+        st.dataframe(df_agg)
+
+        # Optional Bar Chart
+        create_plotly_chart(df_agg, x=selected_group, y="Average", chart_type="bar", title="Aggregated Averages")
+
+
+# ------------------ TRADE FLOW TAB ------------------ #
+class TradeFlowTab(Tab):
+    def render(self):
+        st.subheader(f"Trade Flow Tab (ID: {self.tab_id[:8]})")
+
+        df = self.data_manager.aggregate_data()
+        if df.empty:
+            st.warning("No data available.")
+            return
+
+        if not validate_columns(df, ["date", "sicovam", "end_client"]):
+            return
+
+        df["date"] = pd.to_datetime(df["date"])
+        df = df.sort_values(["sicovam", "end_client", "date"])
+
+        # Identify the first trade
+        df["is_first_trade"] = df.groupby(["sicovam", "end_client"])["date"].rank(method="first") == 1
+
+        # Aggregate first trades and remaining trades
+        first_trades = df[df["is_first_trade"]]
+        total_trades = df.groupby(["sicovam", "end_client"], as_index=False)["nominal"].sum()
+
+        merged = pd.merge(first_trades, total_trades, on=["sicovam", "end_client"], suffixes=("_first", "_total"))
+        merged["percentage_first"] = (merged["nominal_first"] / merged["nominal_total"]) * 100
+
+        st.dataframe(merged[["sicovam", "end_client", "nominal_first", "nominal_total", "percentage_first"]])
+
+
+# ------------------ DATA MANAGER ------------------ #
+class DataManager:
+    def __init__(self):
+        self.data_map = {}
+
+    def load_data(self, file_obj) -> str:
+        unique_id = str(uuid.uuid4())
+        filename = file_obj.name.lower()
+
+        if filename.endswith(".xlsx"):
+            try:
+                df = pd.read_excel(file_obj)
+            except ImportError:
+                st.error("Could not import openpyxl. Install via `pip install openpyxl`.")
+                return ""
+        elif filename.endswith(".csv"):
+            df = pd.read_csv(file_obj)
+        else:
+            st.warning(f"Unsupported file type: {file_obj.name}")
+            return ""
+
+        self.data_map[unique_id] = (df, file_obj.name)
+        return unique_id
+
+    def aggregate_data(self) -> pd.DataFrame:
+        if not self.data_map:
+            return pd.DataFrame()
+        all_dfs = [pair[0] for pair in self.data_map.values()]
+        if len(all_dfs) == 1:
+            return all_dfs[0]
+        return pd.concat(all_dfs, ignore_index=True)
+
+    def get_column_names(self) -> List[str]:
+        return list(self.aggregate_data().columns)
+
+
+# ------------------ SHEET MANAGER ------------------ #
+class SheetManager:
+    def __init__(self):
+        self.sheets = []
+
+    def add_sheet(self):
+        self.sheets.append([])
+
+    def delete_sheet(self, index: int):
+        if 0 <= index < len(self.sheets):
+            self.sheets.pop(index)
+
+    def add_tab_to_sheet(self, sheet_index: int, tab: Tab):
+        if 0 <= sheet_index < len(self.sheets):
+            self.sheets[sheet_index].append(tab)
+
+    def delete_tab_from_sheet(self, sheet_index: int, tab_index: int):
+        if 0 <= sheet_index < len(self.sheets):
+            if 0 <= tab_index < len(self.sheets[sheet_index]):
+                self.sheets[sheet_index].pop(tab_index)
+
+    def get_sheet_count(self) -> int:
+        return len(self.sheets)
+
+    def get_tabs_in_sheet(self, sheet_index: int) -> List[Tab]:
+        if 0 <= sheet_index < len(self.sheets):
+            return self.sheets[sheet_index]
+        return []
+
+    def render_sheet(self, sheet_index: int):
+        if sheet_index < 0 or sheet_index >= len(self.sheets):
+            st.write("No sheet selected.")
+            return
+
+        tabs = self.sheets[sheet_index]
+        if not tabs:
+            st.write("This sheet has no tabs.")
+            return
+
+        tab_titles = [
+            f"{i+1}: {type(t).__name__} [{t.tab_id[:8]}]"
+            for i, t in enumerate(tabs)
+        ]
+        st_tabs = st.tabs(tab_titles)
+        for i, tab_instance in enumerate(tabs):
+            with st_tabs[i]:
+                tab_instance.render()
+
+
+# ------------------ STREAMLIT APP ------------------ #
+class StreamlitApp:
+    def __init__(self):
+        pass
+
+    def run(self):
+        st.title("OOP Dashboard")
+
+        self.init_session_state()
+
+        sheet_manager: SheetManager = st.session_state["sheet_manager"]
+        data_manager: DataManager = st.session_state["data_manager"]
+        tab_factory: TabFactory = st.session_state["tab_factory"]
+
+        with st.sidebar:
+            st.header("Sheet Management")
+
+            if st.button("Add New Sheet", key="add_sheet_btn"):
+                sheet_manager.add_sheet()
+                st.session_state["active_sheet_idx"] = sheet_manager.get_sheet_count() - 1
+
+            sheet_count = sheet_manager.get_sheet_count()
+            if sheet_count > 0:
+                st.subheader("Existing Sheets:")
+                for i in range(sheet_count):
+                    col1, col2 = st.columns([2, 1])
+                    with col1:
+                        if st.button(f"Sheet {i+1}", key=f"sheet_nav_btn_{i}"):
+                            st.session_state["active_sheet_idx"] = i
+                    with col2:
+                        if st.button("X", key=f"sheet_delete_btn_{i}"):
+                            sheet_manager.delete_sheet(i)
+                            if st.session_state["active_sheet_idx"] >= sheet_manager.get_sheet_count():
+                                st.session_state["active_sheet_idx"] = sheet_manager.get_sheet_count() - 1
+                            st.experimental_rerun()
+
+                active_sheet_idx = st.session_state["active_sheet_idx"]
+                if 0 <= active_sheet_idx < sheet_manager.get_sheet_count():
+                    st.markdown(f"**Active Sheet**: {active_sheet_idx + 1}")
+                else:
+                    st.write("No valid sheet selected.")
+            else:
+                st.write("No sheets yet. Create one above.")
+
+        if sheet_manager.get_sheet_count() > 0:
+            active_sheet_idx = st.session_state["active_sheet_idx"]
+            st.write(f"### Active Sheet: {active_sheet_idx + 1}")
+
+            tab_options = tab_factory.get_tab_options()
+            tab_types = [opt["value"] for opt in tab_options]
+            selected_tab_type = st.selectbox(
+                "Select Tab Type to Add",
+                options=tab_types,
+                key="select_tab_type_main"
+            )
+            if st.button("Add Tab", key="add_tab_btn_main"):
+                new_tab = tab_factory.create_tab(selected_tab_type, data_manager=data_manager)
+                sheet_manager.add_tab_to_sheet(active_sheet_idx, new_tab)
+                st.experimental_rerun()
+
+            existing_tabs = sheet_manager.get_tabs_in_sheet(active_sheet_idx)
+            if existing_tabs:
+                delete_tab_options = [
+                    f"{i+1}: {type(tab).__name__} [{tab.tab_id[:8]}]"
+                    for i, tab in enumerate(existing_tabs)
+                ]
+                tab_to_delete = st.selectbox(
+                    "Select Tab to Delete",
+                    options=["<none>"] + delete_tab_options,
+                    key="delete_tab_select"
+                )
+                if st.button("Delete Tab", key="delete_tab_btn"):
+                    if tab_to_delete != "<none>":
+                        delete_index = delete_tab_options.index(tab_to_delete)
+                        sheet_manager.delete_tab_from_sheet(active_sheet_idx, delete_index)
+                        st.experimental_rerun()
+
+            st.markdown("---")
+            sheet_manager.render_sheet(active_sheet_idx)
+        else:
+            st.write("No sheets to display. Please create one in the sidebar.")
+
+    def init_session_state(self):
+        if "data_manager" not in st.session_state:
+            st.session_state["data_manager"] = DataManager()
+        if "tab_factory" not in st.session_state:
+            st.session_state["tab_factory"] = TabFactory()
+        if "sheet_manager" not in st.session_state:
+            st.session_state["sheet_manager"] = SheetManager()
+        if "active_sheet_idx" not in st.session_state:
+            st.session_state["active_sheet_idx"] = 0
+
+
+# ------------------ TAB FACTORY ------------------ #
+class TabFactory:
+    def __init__(self):
+        self._tab_classes: Dict[str, Tab] = {}
+        self.discover_tabs()
+
+    def discover_tabs(self):
+        for subclass in Tab.__subclasses__():
+            tab_name = subclass.__name__
+            self._tab_classes[tab_name] = subclass
+
+    def create_tab(self, tab_name: str, data_manager=None) -> Tab:
+        if tab_name not in self._tab_classes:
+            raise ValueError(f"Tab '{tab_name}' is not registered.")
+        return self._tab_classes[tab_name](data_manager=data_manager)
+
+    def get_tab_options(self) -> List[dict]:
+        return [{"label": name, "value": name} for name in self._tab_classes.keys()]
+
+
+# ------------------ MAIN ------------------ #
+def main():
+    app = StreamlitApp()
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
